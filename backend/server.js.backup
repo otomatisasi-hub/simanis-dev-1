@@ -1,0 +1,1120 @@
+// ============================================
+// ES MODULE VERSION - server.js (CLEAN & FIXED)
+// ============================================
+import dotenv from 'dotenv'
+import { fileURLToPath } from 'url'
+import path from 'path'
+import express from 'express'
+import multer from 'multer'
+import cors from 'cors'
+import fs from 'fs'
+import { createClient } from '@supabase/supabase-js'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+dotenv.config({ path: path.resolve(__dirname, '../.env') })
+
+const app = express()
+const PORT = process.env.PORT || 3001
+
+app.use(function (req, res, next) {
+  res.header(
+    'Access-Control-Allow-Origin',
+    'https://22877e8b6fa1.ngrok-free.app',
+  )
+  res.header(
+    'Access-Control-Allow-Headers',
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization',
+  )
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+  next()
+})
+
+// ============================================
+// ENVIRONMENT VALIDATION
+// ============================================
+let supabaseUrl = process.env.VITE_SUPABASE_URL
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+
+if (supabaseUrl && supabaseUrl.endsWith('/')) {
+  supabaseUrl = supabaseUrl.slice(0, -1)
+}
+
+console.log('✅ Checking environment variables...')
+console.log('Supabase URL:', supabaseUrl ? 'Found' : '❌ Missing')
+console.log('Supabase Key:', supabaseKey ? 'Found (SERVICE_ROLE)' : '❌ Missing')
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error('❌ ERROR: Missing Supabase credentials')
+  process.exit(1)
+}
+
+// ============================================
+// SUPABASE CLIENT
+// ============================================
+let supabase
+try {
+  supabase = createClient(supabaseUrl, supabaseKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+      detectSessionInUrl: false,
+    },
+  })
+  console.log('✅ Supabase client initialized (SERVICE_ROLE)')
+} catch (error) {
+  console.error('❌ Failed to initialize Supabase:', error.message)
+  process.exit(1)
+}
+
+// ============================================
+// MIDDLEWARE
+// ============================================
+app.use(cors())
+app.use(express.json())
+app.use('/uploads', express.static(path.join(__dirname, '../public/uploads')))
+
+// ============================================
+// UPLOAD SETUP
+// ============================================
+const uploadDir = path.join(__dirname, '../public/uploads/documents')
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true })
+  console.log('📁 Created upload directory:', uploadDir)
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const { stepId, docId, requestId } = req.body
+    const ext = path.extname(file.originalname)
+    const prefix = requestId || stepId || docId || 'doc'
+    cb(null, `${prefix}-${Date.now()}${ext}`)
+  },
+})
+
+// Terima semua jenis file (batas ukuran tetap 10MB)
+const fileFilter = (req, file, cb) => {
+  cb(null, true)
+}
+
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: { fileSize: 10 * 1024 * 1024 },
+})
+
+// ============================================
+// MIDDLEWARE - ROLE VALIDATION
+// ============================================
+// Versi baru: bisa dipakai sebagai validateRole('admin'),
+// validateRole('admin','super_admin') atau validateRole(['admin','super_admin'])
+function validateRole(...allowedRolesInput) {
+  const flatAllowedRoles = allowedRolesInput.flat()
+
+  return async (req, res, next) => {
+    try {
+      const authHeader = req.headers.authorization
+      if (!authHeader) {
+        return res
+          .status(401)
+          .json({ success: false, error: 'No token provided' })
+      }
+
+      const token = authHeader.replace('Bearer ', '').trim()
+
+      // ✅ Add timeout untuk prevent ETIMEDOUT
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Auth timeout')), 8000),
+      )
+
+      const authPromise = supabase.auth.getUser(token)
+
+      const {
+        data: { user },
+        error: authError,
+      } = await Promise.race([authPromise, timeoutPromise])
+
+      if (authError || !user) {
+        console.error('❌ Auth error:', authError?.message || 'Unknown')
+        return res
+          .status(401)
+          .json({ success: false, error: 'Invalid or expired token' })
+      }
+
+      console.log('✅ User authenticated:', user.email)
+
+      const { data: userRole, error: roleError } = await supabase
+        .from('user_roles')
+        .select('role')
+        .eq('user_id', user.id)
+        .maybeSingle()
+
+      if (roleError || !userRole) {
+        console.error('❌ Role fetch error:', roleError?.message)
+        return res
+          .status(403)
+          .json({ success: false, error: 'No role assigned' })
+      }
+
+      const normalizeRole = (role) => role.toLowerCase().replace(/_/g, '')
+      const normalizedUserRole = normalizeRole(userRole.role)
+      const normalizedAllowedRoles = flatAllowedRoles.map((r) => normalizeRole(r))
+      const hasPermission = normalizedAllowedRoles.includes(normalizedUserRole)
+
+      if (!hasPermission) {
+        return res
+          .status(403)
+          .json({ success: false, error: 'Access denied' })
+      }
+
+      req.user = user
+      req.userRole = userRole.role
+      req.userId = user.id
+
+      console.log('✅ Access granted to:', user.email)
+      next()
+    } catch (error) {
+      console.error('💥 Validation error:', error)
+      if (error.message === 'Auth timeout') {
+        return res.status(503).json({
+          success: false,
+          error: 'Authentication timeout. Please try again.',
+        })
+      }
+
+      return res
+        .status(500)
+        .json({ success: false, error: 'Internal server error' })
+    }
+  }
+}
+
+// ============================================
+// HEALTH CHECK
+// ============================================
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Server running',
+    timestamp: new Date().toISOString(),
+  })
+})
+
+// ============================================
+// UPLOAD ENDPOINTS
+// ============================================
+app.post('/api/upload', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file)
+      return res
+        .status(400)
+        .json({ success: false, error: 'No file provided' })
+    const fileUrl = `/uploads/documents/${req.file.filename}`
+    res.json({
+      success: true,
+      fileUrl,
+      fileName: req.file.originalname,
+      fileSize: req.file.size,
+    })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+app.delete('/api/delete', (req, res) => {
+  try {
+    const { fileUrl } = req.body
+    if (!fileUrl)
+      return res
+        .status(400)
+        .json({ success: false, error: 'File URL required' })
+
+    const filePath = path.join(uploadDir, path.basename(fileUrl))
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+
+    res.json({ success: true, message: 'File deleted' })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// ============================================
+// PNBP ENDPOINTS
+// ============================================
+app.post('/api/pnbp/request', async (req, res) => {
+  try {
+    const serviceId = req.body.service_id || req.body.serviceId
+    const workflowStepInstanceId =
+      req.body.workflow_step_instance_id || req.body.workflowStepInstanceId
+    const requestedBy = req.body.requested_by || req.body.requestedBy
+
+    if (!serviceId || !workflowStepInstanceId || !requestedBy) {
+      return res
+        .status(400)
+        .json({ success: false, error: 'Missing required fields' })
+    }
+
+    const { data: existing } = await supabase
+      .from('pnbp_requests')
+      .select('*')
+      .eq('workflow_step_instance_id', workflowStepInstanceId)
+      .maybeSingle()
+
+    if (existing)
+      return res.json({
+        success: true,
+        message: 'Request exists',
+        data: existing,
+      })
+
+    const { data, error } = await supabase
+      .from('pnbp_requests')
+      .insert({
+        service_id: serviceId,
+        workflow_step_instance_id: workflowStepInstanceId,
+        requested_by: requestedBy,
+        status: 'pending',
+      })
+      .select()
+      .single()
+
+    if (error) throw error
+    res.json({ success: true, message: 'Request created', data })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+app.get('/api/pnbp/request/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('pnbp_requests')
+      .select(
+        `
+    id,
+    service_id,
+    workflow_step_instance_id,
+    requested_by,
+    completed_by,
+    requested_at,
+    completed_at,
+    status,
+    hold_reason,
+    notes,
+    services (
+      id,
+      title,
+      deadline,
+      client_id,
+      clients (
+        id,
+        full_name
+      )
+    ),
+    workflow_step_instances (
+      id,
+      step_order,
+      workflow_instances (
+        id,
+        workflow_templates (
+          id,
+          workflow_template_steps (
+            id,
+            step_order,
+            step_name
+          )
+        )
+      )
+    )
+  `,
+      )
+      .eq('id', req.params.id)
+      .maybeSingle()
+
+    if (error) throw error
+    if (!data) {
+      return res.status(404).json({ success: false, error: 'Not found' })
+    }
+
+    let requestedByProfile = null
+    if (data.requested_by) {
+      const { data: profile, error: profileError } = await supabase
+        .from('profiles')
+        .select('user_id, full_name')
+        .eq('user_id', data.requested_by)
+        .maybeSingle()
+
+      if (profileError) throw profileError
+      requestedByProfile = profile
+        ? { id: profile.user_id, full_name: profile.full_name }
+        : null
+    }
+
+    const enriched = {
+      ...data,
+      requested_by_profile: requestedByProfile,
+    }
+
+    res.json({ success: true, data: enriched })
+  } catch (error) {
+    console.error('💥 /api/pnbp/request/:id error:', error)
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+app.get('/api/pnbp/status/:workflowStepInstanceId', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('pnbp_requests')
+      .select('*')
+      .eq('workflow_step_instance_id', req.params.workflowStepInstanceId)
+      .maybeSingle()
+
+    if (error) throw error
+    res.json({ success: true, data: data || null })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// ============================================
+// INVOICE REQUESTS LIST (untuk Keuangan)
+// ============================================
+app.get(
+  '/api/invoice/requests',
+  validateRole('keuangan', 'admin', 'super_admin'),
+  async (req, res) => {
+    try {
+      const { status } = req.query
+
+      let query = supabase
+        .from('service_finances')
+        .select(
+          `
+          id,
+          service_id,
+          follow_up_type,
+          status,
+          due_date,
+          amount,
+          invoice_number,
+          services (
+            id,
+            title,
+            clients (
+              id,
+              full_name
+            )
+          )
+        `,
+        )
+        .eq('follow_up_type', 'Pembuatan Invoice')
+        .order('created_at', { ascending: false })
+
+      if (status) {
+        query = query.eq('status', status)
+      }
+
+      const { data, error } = await query
+      if (error) throw error
+
+      res.json({
+        success: true,
+        data: data || [],
+      })
+    } catch (error) {
+      console.error('💥 /api/invoice/requests error:', error)
+      res.status(500).json({
+        success: false,
+        error: error.message,
+      })
+    }
+  },
+)
+
+// PNBP complete & hold
+app.post('/api/pnbp/complete', async (req, res) => {
+  try {
+    const { requestId, completedBy, notes } = req.body
+    if (!requestId || !completedBy) {
+      return res.status(400).json({ success: false, error: 'Missing fields' })
+    }
+
+    const { data, error } = await supabase
+      .from('pnbp_requests')
+      .update({
+        status: 'completed',
+        completed_by: completedBy,
+        completed_at: new Date().toISOString(),
+        notes,
+      })
+      .eq('id', requestId)
+      .select()
+      .single()
+
+    if (error) throw error
+    res.json({ success: true, data })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+app.post('/api/pnbp/hold', async (req, res) => {
+  try {
+    const { requestId, completedBy, holdReason } = req.body
+    if (!requestId || !holdReason) {
+      return res.status(400).json({ success: false, error: 'Missing fields' })
+    }
+
+    const { data, error } = await supabase
+      .from('pnbp_requests')
+      .update({
+        status: 'hold',
+        completed_by: completedBy,
+        hold_reason: holdReason,
+      })
+      .eq('id', requestId)
+      .select()
+      .single()
+
+    if (error) throw error
+    res.json({ success: true, data })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// ✅ Upload dokumen PNBP oleh role keuangan
+app.post(
+  '/api/pnbp/upload-document',
+  validateRole('keuangan', 'admin', 'super_admin'),
+  upload.single('file'),
+  async (req, res) => {
+    try {
+      const { requestId, serviceId, serviceFinanceId, amount, paidAt, notes } =
+        req.body
+
+      if (!requestId || !serviceId || !req.file || !paidAt) {
+        return res.status(400).json({ success: false, error: 'Missing fields' })
+      }
+
+      const userId = req.userId
+      const fileUrl = `/uploads/documents/${req.file.filename}`
+
+      const { data: payment, error: paymentError } = await supabase
+        .from('service_fee_payments')
+        .insert({
+          service_id: serviceId,
+          service_finance_id: serviceFinanceId || null,
+          payment_type: 'pnbp',
+          amount: amount ? Number(amount) : null,
+          paid_at: paidAt,
+          file_url: fileUrl,
+          file_name: req.file.originalname,
+          file_mime_type: req.file.mimetype,
+          confirmation_status: 'pending',
+          notes: notes || null,
+          created_by: userId,
+        })
+        .select()
+        .single()
+
+      if (paymentError) throw paymentError
+
+      const { error: updateReqError } = await supabase
+        .from('pnbp_requests')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          completed_by: userId,
+        })
+        .eq('id', requestId)
+
+      if (updateReqError) throw updateReqError
+
+      res.json({ success: true, data: payment, fileUrl })
+    } catch (error) {
+      console.error('/api/pnbp/upload-document error', error)
+      res.status(500).json({ success: false, error: error.message })
+    }
+  },
+)
+
+// ============================================
+// INVOICE ENDPOINTS (REQUEST DARI NOTARIS)
+// ============================================
+app.post(
+  '/api/invoice/request',
+  validateRole('notaris', 'ppat', 'syariah', 'admin', 'super_admin'),
+  async (req, res) => {
+    try {
+      const { serviceId, dueDate, amount } = req.body
+
+      if (!serviceId || !dueDate) {
+        return res.status(400).json({
+          success: false,
+          error: 'serviceId dan dueDate wajib diisi',
+        })
+      }
+
+      const userId = req.userId
+
+      const { data: existing, error: existingError } = await supabase
+        .from('service_finances')
+        .select('*')
+        .eq('service_id', serviceId)
+        .eq('follow_up_type', 'Pembuatan Invoice')
+        .maybeSingle()
+
+      if (existingError) throw existingError
+
+      if (existing) {
+        return res.json({
+          success: true,
+          message: 'Request invoice untuk layanan ini sudah ada',
+          data: existing,
+        })
+      }
+
+      const { data, error } = await supabase
+        .from('service_finances')
+        .insert({
+          service_id: serviceId,
+          follow_up_type: 'Pembuatan Invoice',
+          due_date: dueDate,
+          amount: amount ?? null,
+          status: 'pending',
+          created_by: userId,
+        })
+        .select()
+        .single()
+
+      if (error) throw error
+
+      return res.json({
+        success: true,
+        message: 'Request Invoice berhasil dibuat',
+        data,
+      })
+    } catch (err) {
+      console.error('/api/invoice/request error:', err)
+      return res.status(500).json({
+        success: false,
+        error: err.message || 'Internal server error',
+      })
+    }
+  },
+)
+
+// ============================================
+// NOTIFICATIONS
+// ============================================
+app.get('/api/notifications/:userId', async (req, res) => {
+  try {
+    const { unreadOnly, limit = 50 } = req.query
+    let query = supabase
+      .from('notifications')
+      .select('*')
+      .eq('user_id', req.params.userId)
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit))
+
+    if (unreadOnly === 'true') query = query.eq('is_read', false)
+
+    const { data, error } = await query
+    if (error) throw error
+
+    res.json({
+      success: true,
+      data: data || [],
+      unreadCount: data?.filter((n) => !n.is_read).length || 0,
+    })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+app.post('/api/notifications/mark-read', async (req, res) => {
+  try {
+    if (!req.body.notificationId) {
+      return res
+        .status(400)
+        .json({ success: false, error: 'notificationId required' })
+    }
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('id', req.body.notificationId)
+      .select()
+      .single()
+
+    if (error) throw error
+    res.json({ success: true, data })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// ============================================
+// INVOICE DETAIL & COMPLETE
+// ============================================
+app.get(
+  '/api/invoice/request/:id',
+  validateRole('keuangan', 'admin', 'super_admin'),
+  async (req, res) => {
+    try {
+      const id = req.params.id
+
+      const { data, error } = await supabase
+        .from('service_finances')
+        .select(
+          `
+          id,
+          service_id,
+          follow_up_type,
+          status,
+          due_date,
+          amount,
+          invoice_number,
+          notes,
+          services (
+            id,
+            title,
+            deadline,
+            clients (
+              id,
+              full_name
+            )
+          )
+        `,
+        )
+        .eq('id', id)
+        .eq('follow_up_type', 'Pembuatan Invoice')
+        .maybeSingle()
+
+      if (error) throw error
+      if (!data) {
+        return res
+          .status(404)
+          .json({ success: false, error: 'Invoice request not found' })
+      }
+
+      res.json({ success: true, data })
+    } catch (err) {
+      console.error('/api/invoice/request/:id error:', err)
+      res.status(500).json({ success: false, error: err.message })
+    }
+  },
+)
+
+app.post(
+  '/api/invoice/complete',
+  validateRole('keuangan'),
+  upload.single('file'),
+  async (req, res) => {
+    try {
+      const { financeId, serviceId, invoiceNumber, amount, dueDate, notes } =
+        req.body
+
+      if (!financeId || !serviceId || !invoiceNumber || !req.file || !dueDate) {
+        return res.status(400).json({ success: false, error: 'Missing fields' })
+      }
+
+      const userId = req.userId
+      const fileUrl = `/uploads/documents/${req.file.filename}`
+
+      const { data: payment, error: paymentError } = await supabase
+        .from('service_fee_payments')
+        .insert({
+          service_finance_id: financeId,
+          service_id: serviceId,
+          payment_type: 'invoice',
+          amount: amount ? Number(amount) : null,
+          paid_at: dueDate,
+          file_url: fileUrl,
+          file_name: req.file.originalname,
+          file_mime_type: req.file.mimetype,
+          confirmation_status: 'confirmed',
+          notes: notes || null,
+          created_by: userId,
+        })
+        .select()
+        .single()
+
+      if (paymentError) throw paymentError
+
+      const { error: financeError } = await supabase
+        .from('service_finances')
+        .update({
+          status: 'completed',
+          invoice_number: invoiceNumber,
+          amount: amount ? Number(amount) : null,
+          due_date: dueDate,
+          updated_at: new Date().toISOString(),
+          updated_by: userId,
+        })
+        .eq('id', financeId)
+
+      if (financeError) throw financeError
+
+      res.json({ success: true, data: payment, fileUrl })
+    } catch (err) {
+      console.error('/api/invoice/complete error:', err)
+      res.status(500).json({ success: false, error: err.message })
+    }
+  },
+)
+
+// ============================================
+// ADMIN - USER MANAGEMENT
+// ============================================
+app.get(
+  '/api/admin/users',
+  validateRole(['admin', 'super_admin']),
+  async (req, res) => {
+    try {
+      console.log('📥 Fetching all users...')
+      const { data: authData, error: authError } =
+        await supabase.auth.admin.listUsers()
+
+      if (authError) throw authError
+
+      const enrichedUsers = await Promise.all(
+        authData.users.map(async (user) => {
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select('full_name, phone, employee_id')
+            .eq('user_id', user.id)
+            .maybeSingle()
+
+          const { data: roleData } = await supabase
+            .from('user_roles')
+            .select('role, assigned_at')
+            .eq('user_id', user.id)
+            .maybeSingle()
+
+          return {
+            id: user.id,
+            nama:
+              profile?.full_name ||
+              user.email?.split('@')[0] ||
+              'Unknown',
+            email: user.email,
+            employee_id: profile?.employee_id || null,
+            phone: profile?.phone || null,
+            isactive: !user.banned_until,
+            createdat: user.created_at,
+            role: roleData?.role || null,
+            user_roles: roleData
+              ? [{ role: roleData.role, assigned_at: roleData.assigned_at }]
+              : [],
+          }
+        }),
+      )
+
+      console.log(`✅ Fetched ${enrichedUsers.length} users`)
+      res.json({
+        success: true,
+        data: enrichedUsers,
+        total: enrichedUsers.length,
+      })
+    } catch (error) {
+      console.error('💥 Get users error:', error)
+      res.status(500).json({ success: false, error: error.message })
+    }
+  },
+)
+
+app.get(
+  '/api/admin/users/:userId/permissions',
+  validateRole(['admin', 'super_admin']),
+  async (req, res) => {
+    try {
+      console.log(`📥 Fetching permissions for user: ${req.params.userId}`)
+
+      const { data: permissions, error } = await supabase
+        .from('userpermissions')
+        .select('*')
+        .eq('user_id', req.params.userId)
+        .order('resource')
+
+      if (error) throw error
+
+      if (!permissions || permissions.length === 0) {
+        const defaultResources = [
+          'dashboard',
+          'layanan_ppat',
+          'layanan_keuangan_ppat',
+          'layanan_notaril',
+          'layanan_keuangan_notaril',
+          'layanan_syariah',
+          'layanan_keuangan_syariah',
+          'administrator',
+        ]
+
+        const defaults = defaultResources.map((resource) => ({
+          user_id: req.params.userId,
+          resource,
+          can_create: false,
+          can_read: resource === 'dashboard',
+          can_update: false,
+          can_delete: false,
+        }))
+
+        const { data: created, error: insertError } = await supabase
+          .from('userpermissions')
+          .insert(defaults)
+          .select()
+
+        if (insertError) throw insertError
+        return res.json({ success: true, data: created })
+      }
+
+      res.json({ success: true, data: permissions })
+    } catch (error) {
+      console.error('💥 Get permissions error:', error)
+      res.status(500).json({ success: false, error: error.message })
+    }
+  },
+)
+
+app.put(
+  '/api/admin/users/:userId/permissions',
+  validateRole(['admin', 'super_admin']),
+  async (req, res) => {
+    try {
+      const { permissions } = req.body
+      if (!Array.isArray(permissions)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Permissions must be array',
+        })
+      }
+
+      await supabase
+        .from('userpermissions')
+        .delete()
+        .eq('user_id', req.params.userId)
+
+      const inserts = permissions.map((p) => ({
+        user_id: req.params.userId,
+        resource: p.resource,
+        can_create: p.can_create || false,
+        can_read: p.can_read || false,
+        can_update: p.can_update || false,
+        can_delete: p.can_delete || false,
+      ))
+
+      const { data, error } = await supabase
+        .from('userpermissions')
+        .insert(inserts)
+        .select()
+      if (error) throw error
+
+      console.log(`✅ Updated ${data.length} permissions for ${req.params.userId}`)
+      res.json({ success: true, message: 'Permissions updated', data })
+    } catch (error) {
+      console.error('💥 Update permissions error:', error)
+      res.status(500).json({ success: false, error: error.message })
+    }
+  },
+)
+
+app.put(
+  '/api/admin/users/:userId/role',
+  validateRole(['super_admin']),
+  async (req, res) => {
+    try {
+      const { role } = req.body
+      const validRoles = [
+        'super_admin',
+        'admin',
+        'notaris',
+        'ppat',
+        'syariah',
+        'keuangan',
+      ]
+
+      if (!validRoles.includes(role)) {
+        return res
+          .status(400)
+          .json({ success: false, error: 'Invalid role' })
+      }
+
+      const { data: existing } = await supabase
+        .from('user_roles')
+        .select('*')
+        .eq('user_id', req.params.userId)
+        .maybeSingle()
+
+      let result
+      if (existing) {
+        const { data, error } = await supabase
+          .from('user_roles')
+          .update({
+            role,
+            assigned_at: new Date().toISOString(),
+            assigned_by: req.userId,
+          })
+          .eq('user_id', req.params.userId)
+          .select()
+          .single()
+
+        if (error) throw error
+        result = data
+      } else {
+        const { data, error } = await supabase
+          .from('user_roles')
+          .insert({
+            user_id: req.params.userId,
+            role,
+            assigned_by: req.userId,
+          })
+          .select()
+          .single()
+
+        if (error) throw error
+        result = data
+      }
+
+      console.log(`✅ Role updated: ${req.params.userId} → ${role}`)
+      res.json({ success: true, message: 'Role updated', data: result })
+    } catch (error) {
+      console.error('💥 Update role error:', error)
+      res.status(500).json({ success: false, error: error.message })
+    }
+  },
+)
+
+app.post(
+  '/api/admin/users/:userId/transfer-and-delete',
+  validateRole('super_admin'),
+  async (req, res) => {
+    const sourceUserId = req.params.userId
+    const { targetUserId } = req.body
+
+    try {
+      if (!targetUserId) {
+        return res.status(400).json({
+          success: false,
+          error: 'targetUserId is required',
+        })
+      }
+      if (sourceUserId === targetUserId) {
+        return res.status(400).json({
+          success: false,
+          error: 'Source and target user must be different',
+        })
+      }
+
+      const { data: authData, error: authError } =
+        await supabase.auth.admin.listUsers()
+      if (authError) throw authError
+
+      const users = authData.users || []
+      const sourceExists = users.some((u) => u.id === sourceUserId)
+      const targetExists = users.some((u) => u.id === targetUserId)
+
+      if (!sourceExists) {
+        return res.status(404).json({
+          success: false,
+          error: 'Source user not found',
+        })
+      }
+      if (!targetExists) {
+        return res.status(404).json({
+          success: false,
+          error: 'Target user not found',
+        })
+      }
+
+      const { error: rpcError } = await supabase.rpc(
+        'transfer_and_delete_user',
+        {
+          old_user: sourceUserId,
+          new_user: targetUserId,
+        },
+      )
+      if (rpcError) throw rpcError
+
+      return res.json({
+        success: true,
+        message:
+          'User data transferred and user deleted/disabled successfully',
+      })
+    } catch (error) {
+      console.error('Transfer and delete user error', error)
+      return res.status(500).json({
+        success: false,
+        error: error.message || 'Internal server error',
+      })
+    }
+  },
+)
+
+app.get(
+  '/api/admin/users/:userId/transfer-preview',
+  validateRole('admin', 'super_admin'),
+  async (req, res) => {
+    const sourceUserId = req.params.userId
+    const targetUserId = req.query.targetUserId
+
+    try {
+      if (!targetUserId) {
+        return res.status(400).json({
+          success: false,
+          error: 'targetUserId is required',
+        })
+      }
+      if (sourceUserId === targetUserId) {
+        return res.status(400).json({
+          success: false,
+          error: 'Source and target user must be different',
+        })
+      }
+
+      const { count: clientsTotal, error: clientsError } = await supabase
+        .from('clients')
+        .select('id', { count: 'exact', head: true })
+        .eq('created_by', sourceUserId)
+
+      if (clientsError) throw clientsError
+
+      const { count: servicesTotal, error: servicesError } = await supabase
+        .from('services')
+        .select('id', { count: 'exact', head: true })
+        .or(`created_by.eq.${sourceUserId},assigned_to.eq.${sourceUserId}`)
+
+      if (servicesError) throw servicesError
+
+      return res.json({
+        success: true,
+        data: {
+          clients_created_by: clientsTotal ?? 0,
+          services_related: servicesTotal ?? 0,
+        },
+      })
+    } catch (error) {
+      console.error('Transfer preview error', error)
+      return res.status(500).json({
+        success: false,
+        error: error.message || 'Internal server error',
+      })
+    }
+  },
+)
+
+// ============================================
+// START SERVER
+// ============================================
+app.listen(PORT, () => {
+  console.log('\n🚀 ================================')
+  console.log('✅ Server ready!')
+  console.log('================================')
+  console.log(`📡 http://localhost:${PORT}`)
+  console.log(`📁 ${uploadDir}`)
+  console.log('================================\n')
+})
